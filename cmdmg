@@ -1,0 +1,313 @@
+#!/bin/sh
+# cmdmg — manage shell aliases and scripts outside of $HOME
+# POSIX sh — no bashisms
+
+set -eu
+
+PROJECT_DIR="/data/Documents/my-command-shortcuts"
+ALIASES_DIR="${PROJECT_DIR}/aliases"
+SCRIPTS_DIR="${PROJECT_DIR}/scripts"
+VERSION="0.1.0"
+MARKER_START="# >>>> cmdmg (auto-generated — run: cmdmg install) >>>>"
+MARKER_LINE="[ -f ${PROJECT_DIR}/cmdmg ] && . ${PROJECT_DIR}/cmdmg init"
+MARKER_END="# <<<< cmdmg <<<<"
+ZSHRC="${HOME}/.zshrc"
+
+die() {
+    echo "[cmdmg] $1" >&2
+    exit 1
+}
+
+warn() {
+    echo "[cmdmg] $1" >&2
+}
+
+info() {
+    echo "[cmdmg] $1"
+}
+
+check_project_dir() {
+    if [ ! -d "${PROJECT_DIR}" ]; then
+        warn "directory not accessible: ${PROJECT_DIR}"
+        return 1
+    fi
+    return 0
+}
+
+# --- init: sourced from the marker block in .zshrc ---
+cmd_init() {
+    if ! check_project_dir; then
+        return 0
+    fi
+
+    if [ -d "${ALIASES_DIR}" ]; then
+        for f in "${ALIASES_DIR}"/*.sh; do
+            [ -f "$f" ] || continue
+            # shellcheck disable=SC1090
+            . "$f"
+        done
+    fi
+
+    if [ -d "${SCRIPTS_DIR}" ]; then
+        case ":${PATH}:" in
+            *":${SCRIPTS_DIR}:"*) : ;;
+            *) PATH="${SCRIPTS_DIR}:${PATH}" ;;
+        esac
+        export PATH
+    fi
+}
+
+# --- install: append marker block to .zshrc ---
+cmd_install() {
+    force=0
+    for arg in "$@"; do
+        case "$arg" in
+            --force) force=1 ;;
+        esac
+    done
+
+    if [ ! -f "${ZSHRC}" ]; then
+        touch "${ZSHRC}"
+    fi
+
+    if grep -qF "${MARKER_START}" "${ZSHRC}" 2>/dev/null; then
+        if [ "${force}" -eq 1 ]; then
+            cmd_uninstall_marker_only
+        else
+            die "already installed in ${ZSHRC} (use 'cmdmg install --force' to reinstall)"
+        fi
+    fi
+
+    {
+        echo ""
+        echo "${MARKER_START}"
+        echo "${MARKER_LINE}"
+        echo "${MARKER_END}"
+    } >> "${ZSHRC}"
+
+    info "installed. Restart your shell or run: source ${ZSHRC}"
+}
+
+# --- remove only the marker block from .zshrc (helper) ---
+cmd_uninstall_marker_only() {
+    if [ ! -f "${ZSHRC}" ]; then
+        return 0
+    fi
+    tmp="$(mktemp)"
+    awk -v start="${MARKER_START}" -v end="${MARKER_END}" '
+        $0 == start { skip=1 }
+        !skip { print }
+        $0 == end { skip=0 }
+    ' "${ZSHRC}" > "${tmp}"
+    mv "${tmp}" "${ZSHRC}"
+}
+
+# --- uninstall: remove marker block + delete project dir ---
+cmd_uninstall() {
+    cmd_uninstall_marker_only
+    info "removed marker block from ${ZSHRC}"
+
+    if [ -d "${PROJECT_DIR}" ]; then
+        rm -rf "${PROJECT_DIR}"
+        info "removed project directory: ${PROJECT_DIR}"
+    fi
+}
+
+# --- helper: find category file path from category name ---
+category_file() {
+    echo "${ALIASES_DIR}/$1.sh"
+}
+
+# --- helper: check if alias name already exists anywhere ---
+alias_exists() {
+    name="$1"
+    [ -d "${ALIASES_DIR}" ] || return 1
+    for f in "${ALIASES_DIR}"/*.sh; do
+        [ -f "$f" ] || continue
+        if grep -qE "^alias ${name}=" "$f" 2>/dev/null; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- add: cmdmg add <category/name> <command> ---
+cmd_add() {
+    script_mode=0
+    args=""
+    for arg in "$@"; do
+        case "$arg" in
+            --script) script_mode=1 ;;
+            *) args="${args} ${arg}" ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    set -- ${args}
+
+    [ "$#" -ge 1 ] || die "usage: cmdmg add [--script] <category/name> <command>"
+
+    catname="$1"
+    category="${catname%%/*}"
+    name="${catname#*/}"
+
+    if [ "${category}" = "${catname}" ]; then
+        die "invalid format, expected <category/name>, got: ${catname}"
+    fi
+
+    if [ "${script_mode}" -eq 1 ]; then
+        srcpath="$2"
+        [ -n "${srcpath:-}" ] || die "usage: cmdmg add --script <category/name> <path>"
+        mkdir -p "${SCRIPTS_DIR}"
+        destpath="${SCRIPTS_DIR}/${name}.sh"
+        cp "${srcpath}" "${destpath}"
+        chmod +x "${destpath}"
+        info "registered script: ${destpath}"
+        return 0
+    fi
+
+    shift
+    command="$*"
+    [ -n "${command}" ] || die "usage: cmdmg add <category/name> <command>"
+
+    if existing_file="$(alias_exists "${name}")"; then
+        die "alias '${name}' already exists in ${existing_file}"
+    fi
+
+    mkdir -p "${ALIASES_DIR}"
+    file="$(category_file "${category}")"
+
+    if [ ! -f "${file}" ]; then
+        echo "# Category: ${category} — ${category} shortcuts" > "${file}"
+    fi
+
+    echo "alias ${name}='${command}'" >> "${file}"
+    info "added alias '${name}' to ${category}"
+}
+
+# --- rm: cmdmg rm <category/name> ---
+cmd_rm() {
+    [ "$#" -ge 1 ] || die "usage: cmdmg rm <category/name>"
+    catname="$1"
+    category="${catname%%/*}"
+    name="${catname#*/}"
+
+    if [ "${category}" = "${catname}" ]; then
+        die "invalid format, expected <category/name>, got: ${catname}"
+    fi
+
+    file="$(category_file "${category}")"
+    [ -f "${file}" ] || die "category not found: ${category}"
+
+    if ! grep -qE "^alias ${name}=" "${file}"; then
+        die "alias '${name}' not found in category '${category}'"
+    fi
+
+    tmp="$(mktemp)"
+    grep -vE "^alias ${name}=" "${file}" > "${tmp}" || true
+    mv "${tmp}" "${file}"
+
+    # if only the header comment remains, remove the file
+    remaining="$(grep -vE '^#' "${file}" | grep -c . || true)"
+    if [ "${remaining}" -eq 0 ]; then
+        rm -f "${file}"
+    fi
+
+    info "removed alias '${name}' from ${category}"
+}
+
+# --- ls: cmdmg ls [category] ---
+cmd_ls() {
+    filter="${1:-}"
+
+    if [ ! -d "${ALIASES_DIR}" ]; then
+        info "no aliases directory found"
+        return 0
+    fi
+
+    printf "%-16s %-12s %s\n" "NAME" "CATEGORY" "COMMAND"
+
+    for f in "${ALIASES_DIR}"/*.sh; do
+        [ -f "$f" ] || continue
+
+        category="$(basename "$f" .sh)"
+
+        if [ -n "${filter}" ] && [ "${category}" != "${filter}" ]; then
+            continue
+        fi
+
+        while IFS= read -r line; do
+            case "$line" in
+                "alias "*)
+                    rest="${line#alias }"
+                    aname="${rest%%=*}"
+                    acmd="${rest#*=}"
+                    # strip surrounding quotes
+                    acmd="${acmd#\'}"
+                    acmd="${acmd%\'}"
+                    printf "%-16s %-12s %s\n" "${aname}" "${category}" "${acmd}"
+                    ;;
+            esac
+        done < "$f"
+    done
+}
+
+# --- reload: re-source all alias files ---
+cmd_reload() {
+    cmd_init
+    info "reloaded"
+}
+
+# --- path: print PROJECT_DIR ---
+cmd_path() {
+    echo "${PROJECT_DIR}"
+}
+
+# --- version ---
+cmd_version() {
+    echo "cmdmg ${VERSION}"
+}
+
+# --- help ---
+cmd_help() {
+    cat <<EOF
+cmdmg ${VERSION} — manage shell aliases and scripts outside \$HOME
+
+Usage:
+  cmdmg install [--force]           Add marker block to ~/.zshrc
+  cmdmg uninstall                   Remove marker block and delete project dir
+  cmdmg add <category/name> <cmd>   Add a new alias
+  cmdmg add --script <cat/name> <path>  Register a new script
+  cmdmg rm <category/name>          Remove an alias
+  cmdmg ls [category]               List aliases (table format)
+  cmdmg reload                      Re-source all aliases
+  cmdmg path                        Print project directory
+  cmdmg version                     Print version
+  cmdmg help                        Show this help
+EOF
+}
+
+main() {
+    cmd="${1:-help}"
+    [ "$#" -gt 0 ] && shift || true
+
+    case "${cmd}" in
+        init) cmd_init ;;
+        install) cmd_install "$@" ;;
+        uninstall) cmd_uninstall ;;
+        add) cmd_add "$@" ;;
+        rm) cmd_rm "$@" ;;
+        ls) cmd_ls "$@" ;;
+        reload) cmd_reload ;;
+        path) cmd_path ;;
+        version|--version|-v) cmd_version ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            warn "unknown command: ${cmd}"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
