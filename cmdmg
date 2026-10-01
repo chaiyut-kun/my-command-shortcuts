@@ -2,9 +2,46 @@
 # cmdmg — manage shell aliases and scripts outside of $HOME
 # POSIX sh — no bashisms
 
-set -eu
+# Only enable strict error handling for CLI commands, NEVER when sourced into interactive shell (init)
+case "${1:-}" in
+    init) ;;
+    *) set -eu ;;
+esac
 
-PROJECT_DIR="/data/Documents/my-command-shortcuts"
+# --- resolve PROJECT_DIR dynamically or from environment ---
+resolve_project_dir() {
+    if [ -n "${CMDMG_DIR:-}" ]; then
+        echo "${CMDMG_DIR}"
+        return 0
+    fi
+
+    # Follow symlinks to locate the real script directory (POSIX compliant)
+    target="${0}"
+    while [ -L "${target}" ]; do
+        target_dir="$(cd "$(dirname "${target}")" && pwd)"
+        target="$(readlink "${target}")"
+        case "${target}" in
+            /*) ;;
+            *) target="${target_dir}/${target}" ;;
+        esac
+    done
+
+    if [ -f "${target}" ]; then
+        cd "$(dirname "${target}")" && pwd
+        return 0
+    fi
+
+    echo "/data/Documents/my-command-shortcuts"
+}
+
+PROJECT_DIR="$(resolve_project_dir)"
+
+# Expand tilde (~) if present in PROJECT_DIR
+case "${PROJECT_DIR}" in
+    "~"/*) PROJECT_DIR="${HOME}/${PROJECT_DIR#\~/}" ;;
+    "~")   PROJECT_DIR="${HOME}" ;;
+esac
+
 ALIASES_DIR="${PROJECT_DIR}/aliases"
 SCRIPTS_DIR="${PROJECT_DIR}/scripts"
 VERSION="0.1.0"
